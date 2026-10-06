@@ -152,8 +152,7 @@ def main() -> None:
     preflight = [
         sys.executable,
         str(ROOT / "scripts/check_grpo_runtime.py"),
-        *overrides,
-        *extra,
+        *command[5:],
     ]
     preflight_status = subprocess.call(preflight, cwd=ROOT, env=environment)
     if preflight_status:

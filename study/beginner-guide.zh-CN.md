@@ -142,7 +142,7 @@ flowchart TD
 
 当前主流程使用的是 **Final-200 Clean**。README 中 `0.0% / 60.5% / 62.0%` 那张表是旧测试集上的历史结果；训练数据和配置记录也存在版本差异。你的复现目标首先是得到当前协议下的可比较结果，不能把历史百分比当作此次运行必须命中的数值。
 
-**本地代码还存在两处会阻止 GRPO 启动的问题：启动器引用未定义变量、环境源码与冻结哈希不一致。** 第 7.1 节给出具体位置。以下是核对过入口的执行指南；这些问题修复之前，不能声称当前代码可直接完整跑通。本文没有修改训练源码或冻结环境。
+**第 7.1 节的两处 GRPO 启动问题已修复：启动器正确传递预检查参数，冻结哈希与经过核验的环境源码一致。** 对应 CPU 回归检查已通过；实际 GPU 训练仍需在服务器上完成 SFT 后验证。
 
 <a id="reproduction"></a>
 
@@ -169,7 +169,7 @@ uv --version
 
 硬件方面，README 的 GRPO 配置在单张 96 GB GPU 上验证过；SFT 的历史记录也出现过约 89 GiB 峰值显存。因此不能仅根据“模型只有 2B”推断小显存机器一定能跑默认配置。先确认执行机器满足实际配置需求，再进行耗时训练。
 
-第一次使用默认配置即可，无需先设置 SwanLab、重新采集数据或研究 GRPO 公式。还应先处理第 7.1 节的已知启动问题。
+第一次使用默认配置即可，无需先设置 SwanLab、重新采集数据或研究 GRPO 公式。第 7.1 节说明 GRPO 启动问题的修复与运行前提。
 
 ### 3.1 安装依赖，准备商店数据
 
@@ -315,7 +315,7 @@ bash scripts/grpo.sh --dry-run
 
 这会检查 SFT 模型与数据路径，并打印配置和将要执行的 VERL 命令；不会启动 CUDA 或 Ray。**它必须放在 SFT 合并完成之后执行**，也不会证明真实启动分支或全部运行时检查都正常。
 
-确认输入正确、且第 7.1 节的问题已修复后，开始训练：
+确认输入正确、GPU 已空闲可用后，开始训练。正式启动会先执行依赖、配置和冻结环境的预检查，通过后才进入 VERL：
 
 ```bash
 bash scripts/grpo.sh
@@ -742,7 +742,7 @@ EXP=grpo_rollout_2
   --model outputs/models/sft-merged
 ```
 
-这组训练写入 `outputs/ablations/grpo_rollout_2/`。它仍受第 7.1 节的 GRPO 启动问题影响。该注册表启动器的 `--dry-run` 只是打印解析结果和下游命令，不会实际调用下游 GRPO 的路径或运行时检查。
+这组训练写入 `outputs/ablations/grpo_rollout_2/`，共用第 7.1 节已修复的 GRPO 入口。该注册表启动器的 `--dry-run` 只是打印解析结果和下游命令，不会实际调用下游 GRPO 的路径或运行时检查。
 
 选定验证集 checkpoint，例如 step 100，终端 C：
 
@@ -798,15 +798,15 @@ bash scripts/grpo.sh --logger swanlab
 
 ## 7. 当前代码中影响复现的具体问题
 
-这些是对实际文件的检查结果，目的是让你知道错误来自哪里。它们不改变主流程，也没有在本文中被自动修复。
+这些是对实际文件的检查结果，目的是让你知道错误来自哪里。第 7.1 节的 GRPO 启动问题已在代码中修复；其他问题按各节说明处理。
 
-### 7.1 GRPO 启动前必须处理的两处问题
+### 7.1 GRPO 启动的两处问题与修复
 
 **问题一：`train_grpo.py` 的真实启动分支引用未定义变量。**
 
-[train_grpo.py](../scripts/train_grpo.py) 的 `build_command()` 定义了 `overrides` 和 `extra`，但 `main()` 构造 `preflight` 时又直接使用这两个局部变量。真实训练分支会触发 `NameError`。`--dry-run` 在这段之前返回，因此 dry-run 成功无法排除这个问题。
+[train_grpo.py](../scripts/train_grpo.py) 原先在 `main()` 构造 `preflight` 时，引用了只在 `build_command()` 中定义的 `overrides` 和 `extra`，导致真实训练分支触发 `NameError`。`--dry-run` 在这段之前返回，因此此前 dry-run 成功无法排除这个问题。
 
-修复时需要让预检查收到已经解析完成的 Hydra 参数。例如在当前命令结构下，可把预检查构造中的 `*overrides, *extra` 改为使用 `command[5:]`：
+现在预检查直接复用已经构造好的训练命令中的 Hydra 参数，包括 logger、实验名称和用户追加的 overrides：
 
 ```python
 preflight = [
@@ -816,23 +816,25 @@ preflight = [
 ]
 ```
 
-这里的前五项是 Python、`-m`、VERL 入口、配置路径和配置名，后面才是 Hydra overrides。这是针对当前脚本结构的修复示例，本文没有把它写入源码；修复后还需验证非 dry-run 的预检查能够进入并通过。
+这里的前五项是 Python、`-m`、VERL 入口、配置路径和配置名，后面才是 Hydra overrides。对应回归测试实际进入非 dry-run 分支，并拦截子进程调用，验证预检查参数与训练命令一致；测试不会启动训练。
 
 **问题二：环境源码与冻结 manifest 不一致。**
 
-[check_grpo_runtime.py](../scripts/check_grpo_runtime.py) 会检查 [data/environment.json](../data/environment.json) 中的环境源码 SHA-256。当前 [web_agent_text_env.py](../environments/ShopSimulator/shop_env/web_agent_site/envs/web_agent_text_env.py) 即使按 LF 换行计算，仍与 manifest 不同：
+[check_grpo_runtime.py](../scripts/check_grpo_runtime.py) 会检查 [data/environment.json](../data/environment.json) 中的环境源码 SHA-256。核对 Git 提交 `d99a0ac` 后确认：该提交只删除了 [web_agent_text_env.py](../environments/ShopSimulator/shop_env/web_agent_site/envs/web_agent_text_env.py) 商品详情页中未定义的 `selected_option` 参数，但没有同步更新 manifest。
 
 ```text
-manifest 预期：
+manifest 原先记录的哈希：
 448f5ec31fe5a71d1e43376d42cd84787a0e48fe96a8032fc0383f65e5928ea2
 
-当前源码，按 LF 换行：
+保留上述修复后的源码，按 LF 换行；现在 manifest 使用此值：
 d6db15f282849847a364d8d36af0eed113c1c97184a1ded98eb1fd29dab577d1
 ```
 
-因此，修复第一处后还会遇到运行时哈希检查失败。需要核对冻结的 Environment v2.1 源码与 manifest 来源，恢复一致的、经过审查的环境资产。仅为了启动而跳过哈希检查，无法证明你复现的是仓库规定的环境。
+现在只更新 manifest 中 `web_agent_text_env.py` 这一项哈希，其他四项源码哈希与现有 LF 源码一致。环境源码、Reward v3、Observation v2、Tool v2 和显式释放合同均未改动，运行时仍严格检查文件字节哈希。
 
-此外，Windows 工作区的 CRLF 换行会改变文件字节哈希，也可能使 Bash 脚本报错。准备 Linux 运行目录时，应使用保持原始 LF 的仓库检出；不要直接把已转换换行的工作区当作经过校验的运行资产。上面这一处源码差异不能仅由换行解释。
+Windows 工作区的 CRLF 换行会改变文件字节哈希，也可能使 Bash 脚本报错。准备 Linux 运行目录时，应使用保持原始 LF 的仓库检出。上述源码差异来自已核验的修复，不能仅由换行解释。
+
+使用 `prepare_env` 脚本配置的 CUDA 12.9 环境时，继续使用原来的 `.venv-setup/activate.sh` 或 `.venv-setup/activate-baseline.sh` 激活文件，保留其动态库路径。这些激活文件默认设置 `CUDA_VISIBLE_DEVICES=-1`；只有 GPU 空闲可用后，才在训练终端选择可用卡，例如单卡配置的 `export CUDA_VISIBLE_DEVICES=0`。SFT 合并模型生成之前，3.6 的 dry-run 与正式训练仍会拒绝缺失的模型路径。
 
 ### 7.2 综合报告模板还不适合直接解释新实验
 
@@ -959,7 +961,7 @@ Qwen3.8-27B 记录使用 BF16 权重、4 卡 tensor parallel、FP8 KV cache，�
 
 #### GRPO 和对照实验
 
-- [train_grpo.py](../scripts/train_grpo.py)：解析模型与数据参数，构造环境变量、Hydra 命令和运行检查；当前真实执行分支有第 7.1 节所述问题。
+- [train_grpo.py](../scripts/train_grpo.py)：解析模型与数据参数，构造环境变量、Hydra 命令和运行检查；第 7.1 节所述的参数作用域问题已修复。
 - [grpo.sh](../scripts/grpo.sh)：调用项目 GRPO Python 启动器。
 - [export_grpo.sh](../scripts/export_grpo.sh)：调用 `verl.model_merger` 导出选中 Actor 的 FSDP 检查点，供 vLLM 加载。
 - [run_experiment.py](../scripts/run_experiment.py)：将 `experiments.json` 中的命名设置翻译成已有 SFT/GRPO 启动命令；不是另一个训练算法实现。
